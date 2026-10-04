@@ -8,6 +8,7 @@ ACTION_ROLES = {
     "assess": {"analyst"},
     "record_opinion": {"operator"},
     "approve": {"coordinator"},
+    "modify_window": {"coordinator"},
     "execute": {"operator"},
     "resolve": {"coordinator"},
     "cancel": {"coordinator"},
@@ -15,7 +16,14 @@ ACTION_ROLES = {
 }
 ENFORCE_REGION = False
 REGION_SENSITIVE_ACTIONS = set()
-ACTION_REQUIRES_VERSION = {"approve", "execute", "resolve", "cancel"}
+ACTION_REQUIRES_VERSION = {
+    "approve",
+    "modify_window",
+    "execute",
+    "resolve",
+    "cancel",
+}
+QUEUED_STATUS = "queued"
 
 
 def assess(payload):
@@ -35,7 +43,7 @@ def assess(payload):
 
 def _need_status(item, allowed):
     if item["status"] not in allowed:
-        raise DomainError("invalid_state", "当前状态 %s 不允许执行该操作" % item["status"])
+        raise DomainError("invalid_state", "当前状态 %s 不允许执行该操作" % item["status"], 409)
 
 
 def _require_number(payload, name, minimum=None):
@@ -70,7 +78,7 @@ def apply_action(item, action, payload, actor, role):
         return "assessed", current, {"assessment": result, "actor": actor}
 
     if action == "report_revision":
-        _need_status(item, {"pending", "assessed", "coordinating", "executing"})
+        _need_status(item, {"pending", "assessed", "coordinating", QUEUED_STATUS, "executing"})
         revision = {
             "observed_at": _require_text(payload, "observed_at"),
             "miss_distance_m": _require_number(payload, "miss_distance_m", 0),
@@ -86,7 +94,7 @@ def apply_action(item, action, payload, actor, role):
         return status, current, {"revision": revision}
 
     if action == "record_opinion":
-        _need_status(item, {"assessed", "coordinating"})
+        _need_status(item, {"assessed", "coordinating", QUEUED_STATUS})
         opinion = _require_text(payload, "opinion").lower()
         if opinion not in {"approve", "reject", "request_review"}:
             raise DomainError("invalid_opinion", "意见必须是 approve、reject 或 request_review")
@@ -98,16 +106,24 @@ def apply_action(item, action, payload, actor, role):
         return status, current, {"opinion": entry}
 
     if action == "approve":
+        # 窗口占座在 Service/Repository 层处理（跨事件容量需要事务），
+        # 这里只保留状态机与燃料、意见冲突校验。
         _need_status(item, {"assessed"})
-        if current.get("conflict"):
-            raise DomainError("unresolved_conflict", "存在未解决的运营方冲突意见", 409)
+        validate_approve(current, payload)
         fuel = _require_number(payload, "fuel_cost_m_s", 0)
-        budget = float(current.get("fuel_budget_m_s", 0))
-        if fuel > budget:
-            raise DomainError("fuel_budget_exceeded", "规避燃料超过预算", 409)
-        window = _require_text(payload, "maneuver_window")
-        current["approved_maneuver"] = {"fuel_cost_m_s": fuel, "maneuver_window": window}
-        return "coordinating", current, {"approved_maneuver": current["approved_maneuver"]}
+        return "coordinating", current, {"fuel_cost_m_s": fuel}
+
+    if action == "modify_window":
+        _need_status(item, {"coordinating", QUEUED_STATUS})
+        from . import scheduling
+
+        start, end = scheduling.parse_window(payload)
+        maneuver = dict(current.get("approved_maneuver") or {})
+        maneuver["requested_window"] = scheduling.format_window(start, end)
+        if "maneuver_window" in maneuver:
+            maneuver["maneuver_window"] = maneuver["requested_window"]
+        current["approved_maneuver"] = maneuver
+        return status, current, {"requested_window": maneuver["requested_window"]}
 
     if action == "execute":
         _need_status(item, {"coordinating"})
@@ -122,9 +138,20 @@ def apply_action(item, action, payload, actor, role):
         return "resolved", current, {"report_ref": report_ref}
 
     if action == "cancel":
-        _need_status(item, {"pending", "assessed"})
+        _need_status(item, {"pending", "assessed", "coordinating", QUEUED_STATUS})
         reason = _require_text(payload, "reason")
         current["cancellation"] = {"reason": reason, "cancelled_by": actor}
         return "cancelled", current, {"reason": reason}
 
     raise DomainError("unknown_action", "不支持的操作")
+
+
+def validate_approve(current, payload):
+    """批准前置校验：运营方意见冲突优先于任何占座尝试。"""
+    if current.get("conflict"):
+        raise DomainError("unresolved_conflict", "存在未解决的运营方冲突意见", 409)
+    fuel = _require_number(payload, "fuel_cost_m_s", 0)
+    budget = float(current.get("fuel_budget_m_s", 0))
+    if fuel > budget:
+        raise DomainError("fuel_budget_exceeded", "规避燃料超过预算", 409)
+    return fuel

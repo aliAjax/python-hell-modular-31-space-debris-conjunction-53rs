@@ -50,6 +50,8 @@ def build_handler(service, static_dir):
                     return self._send(200, {"status": "ok"})
                 if path == "/api/state":
                     return self._send(200, service.state())
+                if path == "/api/directory":
+                    return self._send(200, {"entries": service.list_directory()})
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
                 parts = [part for part in path.split("/") if part]
@@ -78,8 +80,14 @@ def build_handler(service, static_dir):
                 parts = [part for part in path.split("/") if part]
                 if parts == ["api", "items"]:
                     return self._send(201, service.create_item(payload, actor, role, region))
+                if parts == ["api", "directory"]:
+                    return self._send(201, service.sync_directory(payload, actor, role))
+                if parts == ["api", "reconcile"]:
+                    return self._send(200, service.reconcile(actor, role))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
                     return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "reconcile":
+                    return self._send(200, service.reconcile(actor, role, int(parts[2])))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":
                     action = payload.pop("action", "")
                     if not action:

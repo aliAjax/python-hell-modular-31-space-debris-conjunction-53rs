@@ -1,7 +1,13 @@
 <!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><title>太空碎片接近协调</title>
-<body><h1>太空碎片接近预警与规避协调</h1><p>服务已启动。使用 JSON API 创建接近事件、记录来源、执行评估和协调动作。</p><pre>GET /health
-GET /api/state
+<body><h1>太空碎片接近预警与规避协调</h1><p>服务已启动。使用 JSON API 管理接近事件、外部指挥目录圈次与时段账。</p><pre>GET  /health
+GET  /api/state
+GET  /api/items
 POST /api/items
 POST /api/items/{id}/sources
-POST /api/items/{id}/actions</pre></body></html>
+POST /api/items/{id}/actions            # assess / approve / modify_window / execute / resolve / cancel
+GET  /api/directory
+POST /api/directory                     # 同步外部指挥目录圈次
+POST /api/reconcile                     # 与外部目录对账
+POST /api/items/{id}/reconcile          # 对单个事件对账</pre>
+<p>批准（approve）携带 window_start/window_end 与 directory_ref：占住圈次，容量不足或同一卫星窗口重叠时自动排队顺延；外部目录改期对账后，未执行批准失效退回重议，已执行保留原记录。</p></body></html>

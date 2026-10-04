@@ -112,3 +112,45 @@ def normalize_source(payload):
         "region": region,
         "operator": payload.get("operator"),
     }
+
+
+def normalize_directory_entry(payload):
+    """外部指挥目录圈次：归属看目录，容量和时段也由目录给定。"""
+    ref = require_text(payload, "directory_ref")
+    satellite_id = require_text(payload, "satellite_id")
+    start_text = require_text(payload, "window_start")
+    end_text = require_text(payload, "window_end")
+    try:
+        start = datetime.fromisoformat(start_text.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
+    except ValueError:
+        raise DomainError("invalid_timestamp", "目录圈次时间必须是 ISO 时间")
+    if start.tzinfo is None or end.tzinfo is None:
+        raise DomainError("invalid_timestamp", "目录圈次时间必须带时区")
+    if end <= start:
+        raise DomainError("invalid_window", "圈次结束时间必须晚于开始时间")
+    capacity = int(positive_integer(payload, "capacity"))
+    if capacity <= 0:
+        raise DomainError("invalid_capacity", "圈次容量必须大于零")
+    status = str(payload.get("status", "scheduled")).strip() or "scheduled"
+    if status not in {"scheduled", "cancelled", "completed"}:
+        raise DomainError("invalid_directory_status", "目录圈次状态非法")
+    directory_version = payload.get("directory_version")
+    if directory_version is not None:
+        directory_version = str(directory_version).strip() or None
+    note = payload.get("note")
+    if note is not None:
+        note = str(note).strip() or None
+    return {
+        "ref": ref,
+        "satellite_id": satellite_id,
+        "start": start,
+        "end": end,
+        "window_start": start.isoformat(),
+        "window_end": end.isoformat(),
+        "capacity": capacity,
+        "status": status,
+        "directory_version": directory_version,
+        "note": note,
+        "source": "external",
+    }
