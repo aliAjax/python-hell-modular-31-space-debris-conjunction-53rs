@@ -45,13 +45,21 @@ def build_handler(service, static_dir):
 
         def do_GET(self):
             try:
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
+                from urllib.parse import parse_qs
+                query = parse_qs(parsed.query)
                 if path == "/health":
                     return self._send(200, {"status": "ok"})
                 if path == "/api/state":
                     return self._send(200, service.state())
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
+                if path == "/api/catalog":
+                    return self._send(200, {"entries": service.list_catalog()})
+                if path == "/api/windows":
+                    satellite_id = query.get("satellite_id", [None])[0]
+                    return self._send(200, {"windows": service.list_windows(satellite_id=satellite_id)})
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "items"]:
                     return self._send(200, service.get_item(int(parts[2])))
@@ -78,6 +86,10 @@ def build_handler(service, static_dir):
                 parts = [part for part in path.split("/") if part]
                 if parts == ["api", "items"]:
                     return self._send(201, service.create_item(payload, actor, role, region))
+                if parts == ["api", "catalog"]:
+                    return self._send(201, service.sync_catalog(payload, actor, role))
+                if parts == ["api", "reconcile"]:
+                    return self._send(200, service.reconcile(actor, role))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
                     return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":
@@ -86,6 +98,9 @@ def build_handler(service, static_dir):
                         raise DomainError("action_required", "缺少 action", 400)
                     expected = payload.pop("expected_version", None)
                     return self._send(200, service.act(int(parts[2]), action, payload, actor, role, expected, region))
+                if len(parts) == 4 and parts[:2] == ["api", "windows"] and parts[3] == "reschedule":
+                    expected = payload.pop("expected_version", None)
+                    return self._send(200, service.reschedule_window(int(parts[2]), payload, actor, role, expected))
                 return self._send(404, {"error": "not_found", "message": "接口不存在"})
             except DomainError as exc:
                 return self._error(exc)

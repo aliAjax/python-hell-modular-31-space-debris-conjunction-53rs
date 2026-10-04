@@ -1,13 +1,8 @@
 import json
 import sqlite3
-from datetime import datetime, timezone
 
-from .audit import audit_hash, canonical_json
+from .audit import append_audit_event, canonical_json, now_iso
 from .domain import ConflictError, NotFoundError, DomainError
-
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
 
 
 class Repository:
@@ -70,6 +65,47 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS slots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    satellite_id TEXT NOT NULL,
+                    revolution_no INTEGER NOT NULL,
+                    start_ts TEXT NOT NULL,
+                    end_ts TEXT NOT NULL,
+                    capacity INTEGER NOT NULL DEFAULT 1,
+                    source TEXT NOT NULL DEFAULT 'local',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(satellite_id, revolution_no)
+                );
+                CREATE TABLE IF NOT EXISTS windows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER,
+                    satellite_id TEXT NOT NULL,
+                    slot_id INTEGER NOT NULL,
+                    window_start TEXT NOT NULL,
+                    window_end TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    queue_reason TEXT,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(item_id) REFERENCES items(id),
+                    FOREIGN KEY(slot_id) REFERENCES slots(id)
+                );
+                CREATE TABLE IF NOT EXISTS catalog_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    satellite_id TEXT NOT NULL,
+                    revolution_no INTEGER NOT NULL,
+                    start_ts TEXT NOT NULL,
+                    end_ts TEXT NOT NULL,
+                    maneuver_ref TEXT,
+                    status TEXT NOT NULL DEFAULT 'planned',
+                    version INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(satellite_id, revolution_no)
+                );
                 """
             )
         finally:
@@ -82,28 +118,8 @@ class Repository:
         result["payload"] = json.loads(result["payload"])
         return result
 
-    def _last_hash(self, conn, item_id):
-        row = conn.execute(
-            "SELECT event_hash FROM audit_events WHERE item_id IS ? ORDER BY id DESC LIMIT 1",
-            (item_id,),
-        ).fetchone()
-        return row["event_hash"] if row else "GENESIS"
-
     def append_audit(self, conn, item_id, event_type, actor, role, payload):
-        previous = self._last_hash(conn, item_id)
-        event = {
-            "item_id": item_id,
-            "event_type": event_type,
-            "actor": actor,
-            "role": role,
-            "payload": payload,
-            "created_at": now_iso(),
-        }
-        event_hash = audit_hash(previous, event)
-        conn.execute(
-            "INSERT INTO audit_events(item_id,event_type,actor,role,payload,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
-        )
+        return append_audit_event(conn, item_id, event_type, actor, role, payload)
 
     def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
         conn = self.connect()
@@ -145,7 +161,9 @@ class Repository:
             row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
             if row is None:
                 raise NotFoundError("item_not_found", "业务实体不存在")
-            return self._row_to_item(row)
+            item = self._row_to_item(row)
+            item["windows"] = self.list_windows(item_id)
+            return item
         finally:
             conn.close()
 
@@ -207,7 +225,7 @@ class Repository:
         finally:
             conn.close()
 
-    def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None):
+    def apply_action(self, item_id, action, actor, role, new_status, new_payload, event_payload, expected_version=None, ledger=None):
         conn = self.connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -226,6 +244,8 @@ class Repository:
                 (item_id, action, actor, role, canonical_json(event_payload), now_iso()),
             )
             self.append_audit(conn, item_id, action, actor, role, event_payload)
+            if ledger is not None:
+                ledger(conn)
             conn.execute("COMMIT")
             return self.get_item(item_id)
         except Exception:
@@ -257,5 +277,84 @@ class Repository:
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
             return {"counts": counts, "items": self.list_items()}
+        finally:
+            conn.close()
+
+    def list_windows(self, item_id=None, satellite_id=None):
+        conn = self.connect()
+        try:
+            sql = (
+                "SELECT w.*, s.revolution_no AS slot_rev, s.capacity AS slot_capacity "
+                "FROM windows w JOIN slots s ON w.slot_id=s.id"
+            )
+            clauses, params = [], []
+            if item_id is not None:
+                clauses.append("w.item_id=?")
+                params.append(item_id)
+            if satellite_id is not None:
+                clauses.append("w.satellite_id=?")
+                params.append(satellite_id)
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
+            sql += " ORDER BY w.id DESC"
+            return [dict(row) for row in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    def list_catalog(self):
+        conn = self.connect()
+        try:
+            return [dict(row) for row in conn.execute("SELECT * FROM catalog_entries ORDER BY id DESC").fetchall()]
+        finally:
+            conn.close()
+
+    def sync_catalog(self, satellite_id, revolution_no, start_ts, end_ts, maneuver_ref, status):
+        from . import ledger
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            entry = ledger.sync_catalog_entry(conn, satellite_id, revolution_no, start_ts, end_ts, maneuver_ref, status)
+            conn.execute("COMMIT")
+            return entry
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def reschedule_window(self, window_id, new_start, new_end, expected_version):
+        from . import ledger
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            window = ledger.reschedule_window(conn, window_id, new_start, new_end, expected_version)
+            conn.execute("COMMIT")
+            return window
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def reconcile(self):
+        from . import ledger
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            result = ledger.reconcile(conn)
+            conn.execute("COMMIT")
+            return result
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
         finally:
             conn.close()

@@ -13,6 +13,9 @@ ACTION_ROLES = {
     "cancel": {"coordinator"},
     "report_revision": {"analyst"},
 }
+CATALOG_ROLES = {"coordinator", "regulator"}
+WINDOW_ROLES = {"coordinator"}
+RECONCILE_ROLES = {"coordinator", "regulator"}
 ENFORCE_REGION = False
 REGION_SENSITIVE_ACTIONS = set()
 ACTION_REQUIRES_VERSION = {"approve", "execute", "resolve", "cancel"}
@@ -98,7 +101,7 @@ def apply_action(item, action, payload, actor, role):
         return status, current, {"opinion": entry}
 
     if action == "approve":
-        _need_status(item, {"assessed"})
+        _need_status(item, {"assessed", "reopened"})
         if current.get("conflict"):
             raise DomainError("unresolved_conflict", "存在未解决的运营方冲突意见", 409)
         fuel = _require_number(payload, "fuel_cost_m_s", 0)
@@ -122,7 +125,7 @@ def apply_action(item, action, payload, actor, role):
         return "resolved", current, {"report_ref": report_ref}
 
     if action == "cancel":
-        _need_status(item, {"pending", "assessed"})
+        _need_status(item, {"pending", "assessed", "coordinating"})
         reason = _require_text(payload, "reason")
         current["cancellation"] = {"reason": reason, "cancelled_by": actor}
         return "cancelled", current, {"reason": reason}
